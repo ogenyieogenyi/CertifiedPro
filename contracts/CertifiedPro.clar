@@ -533,3 +533,307 @@
     true
   )
 )
+
+
+
+;; Verification token system
+(define-map verification-tokens
+  { token: (string-ascii 81) }
+  {
+    cert-id: uint,
+    created-at: uint,
+    expires-at: uint,
+    created-by: principal,
+    is-used: bool
+  }
+)
+
+(define-constant err-token-expired (err u106))
+(define-constant err-token-invalid (err u107))
+(define-constant err-token-used (err u108))
+
+;; Generate a verification token for a certification
+(define-public (generate-verification-token (cert-id uint) (valid-for-hours uint))
+  (let
+    (
+      (cert (unwrap! (map-get? certifications { id: cert-id }) (err err-not-found)))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (token-string (concat (concat (int-to-ascii  cert-id) "-") (int-to-ascii current-time)))
+      (expiry-time (+ current-time (* valid-for-hours u3600)))
+    )
+    ;; Verify ownership
+    (asserts! (is-eq tx-sender (get owner cert)) (err err-unauthorized))
+    
+    ;; Create verification token
+    (map-set verification-tokens
+      { token: token-string }
+      {
+        cert-id: cert-id,
+        created-at: current-time,
+        expires-at: expiry-time,
+        created-by: tx-sender,
+        is-used: false
+      }
+    )
+    
+    (ok token-string)
+  )
+)
+
+;; Verify a certification using a token
+(define-public (verify-with-token (token (string-ascii 64)))
+  (let
+    (
+      (token-data (unwrap! (map-get? verification-tokens { token: token }) (err err-token-invalid)))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (cert-id (get cert-id token-data))
+    )
+    ;; Check token validity
+    (asserts! (not (get is-used token-data)) (err err-token-used))
+    (asserts! (< current-time (get expires-at token-data)) (err err-token-expired))
+    
+    ;; Mark token as used
+    (map-set verification-tokens
+      { token: token }
+      (merge token-data { is-used: true })
+    )
+    
+    ;; Record verification attempt
+    (verify-certification cert-id)
+  )
+)
+
+;; Get verification token details
+(define-read-only (get-token-details (token (string-ascii 64)))
+  (map-get? verification-tokens { token: token })
+)
+
+
+;; Challenge system for certification validity
+(define-map certification-challenges
+  { challenge-id: uint }
+  {
+    cert-id: uint,
+    challenger: principal,
+    reason: (string-ascii 200),
+    evidence: (string-ascii 200),
+    status: (string-ascii 20),
+    created-at: uint,
+    response: (optional {
+      text: (string-ascii 200),
+      evidence: (string-ascii 200),
+      timestamp: uint
+    }),
+    resolution: (optional {
+      result: (string-ascii 20),
+      resolver: principal,
+      timestamp: uint,
+      notes: (string-ascii 200)
+    })
+  }
+)
+
+(define-map cert-challenge-index
+  { cert-id: uint }
+  { challenge-ids: (list 20 uint) }
+)
+
+(define-data-var next-challenge-id uint u1)
+(define-constant err-challenge-not-found (err u111))
+(define-constant err-already-challenged (err u112))
+(define-constant err-challenge-period-ended (err u113))
+(define-constant err-not-challenger (err u114))
+(define-constant err-already-resolved (err u115))
+
+;; Create a challenge for a certification
+(define-public (challenge-certification 
+    (cert-id uint) 
+    (reason (string-ascii 200))
+    (evidence (string-ascii 200))
+  )
+  (let
+    (
+      (cert (unwrap! (map-get? certifications { id: cert-id }) (err err-not-found)))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (challenge-id (var-get next-challenge-id))
+      (cert-challenges (default-to { challenge-ids: (list) } (map-get? cert-challenge-index { cert-id: cert-id })))
+    )
+    ;; Ensure certification is active
+    (asserts! (get active cert) (err err-expired))
+    ;; Challenger cannot be the owner
+    (asserts! (not (is-eq tx-sender (get owner cert))) (err err-unauthorized))
+    
+    ;; Increment challenge ID
+    (var-set next-challenge-id (+ challenge-id u1))
+    
+    ;; Create the challenge
+    (map-set certification-challenges
+      { challenge-id: challenge-id }
+      {
+        cert-id: cert-id,
+        challenger: tx-sender,
+        reason: reason,
+        evidence: evidence,
+        status: "open",
+        created-at: current-time,
+        response: none,
+        resolution: none
+      }
+    )
+    
+    ;; Update challenge index for the certification
+    (map-set cert-challenge-index
+      { cert-id: cert-id }
+      { 
+        challenge-ids: (unwrap-panic (as-max-len? 
+          (append (get challenge-ids cert-challenges) challenge-id) 
+          u20
+        )) 
+      }
+    )
+    
+    (ok challenge-id)
+  )
+)
+
+;; Respond to a challenge
+(define-public (respond-to-challenge 
+    (challenge-id uint) 
+    (response-text (string-ascii 200))
+    (response-evidence (string-ascii 200))
+  )
+  (let
+    (
+      (challenge (unwrap! (map-get? certification-challenges { challenge-id: challenge-id }) (err err-challenge-not-found)))
+      (cert (unwrap! (map-get? certifications { id: (get cert-id challenge) }) (err err-not-found)))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (challenge-period-end (+ (get created-at challenge) (* u7 u24 u3600))) ;; 7 days to respond
+    )
+    ;; Verify ownership
+    (asserts! (is-eq tx-sender (get owner cert)) (err err-unauthorized))
+    ;; Ensure challenge is still open
+    (asserts! (is-eq (get status challenge) "open") (err err-already-resolved))
+    ;; Ensure response period hasn't ended
+    (asserts! (< current-time challenge-period-end) (err err-challenge-period-ended))
+    
+    ;; Update challenge with response
+    (map-set certification-challenges
+      { challenge-id: challenge-id }
+      (merge challenge { 
+        status: "responded",
+        response: (some {
+          text: response-text,
+          evidence: response-evidence,
+          timestamp: current-time
+        })
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Resolve a challenge (can be done by contract owner or a designated resolver)
+(define-public (resolve-challenge 
+    (challenge-id uint) 
+    (resolution-result (string-ascii 20))
+    (resolution-notes (string-ascii 200))
+  )
+  (let
+    (
+      (challenge (unwrap! (map-get? certification-challenges { challenge-id: challenge-id }) (err err-challenge-not-found)))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    ;; Only contract owner can resolve challenges for now
+    (asserts! (is-eq tx-sender contract-owner) (err err-unauthorized))
+    ;; Ensure challenge hasn't been resolved
+    (asserts! (not (is-eq (get status challenge) "resolved")) (err err-already-resolved))
+    
+    ;; Update challenge with resolution
+    (map-set certification-challenges
+      { challenge-id: challenge-id }
+      (merge challenge { 
+        status: "resolved",
+        resolution: (some {
+          result: resolution-result,
+          resolver: tx-sender,
+          timestamp: current-time,
+          notes: resolution-notes
+        })
+      })
+    )
+    
+    ;; If challenge is upheld, mark certification as disputed
+
+    
+    (ok true)
+  )
+)
+
+;; Withdraw a challenge
+(define-public (withdraw-challenge (challenge-id uint))
+  (let
+    (
+      (challenge (unwrap! (map-get? certification-challenges { challenge-id: challenge-id }) (err err-challenge-not-found)))
+    )
+    ;; Only challenger can withdraw
+    (asserts! (is-eq tx-sender (get challenger challenge)) (err err-not-challenger))
+    ;; Ensure challenge is still open
+    (asserts! (is-eq (get status challenge) "open") (err err-already-resolved))
+    
+    ;; Update challenge status
+    (map-set certification-challenges
+      { challenge-id: challenge-id }
+      (merge challenge { status: "withdrawn" })
+    )
+    
+    (ok true)
+  )
+)
+
+;; Get challenge details
+(define-read-only (get-challenge (challenge-id uint))
+  (map-get? certification-challenges { challenge-id: challenge-id })
+)
+
+;; Get all challenges for a certification
+(define-read-only (get-cert-challenges (cert-id uint))
+  (let
+    ((challenge-ids (get challenge-ids (default-to { challenge-ids: (list) } (map-get? cert-challenge-index { cert-id: cert-id })))))
+    (map get-challenge challenge-ids)
+  )
+)
+
+;; Check if a certification has active challenges
+(define-read-only (has-active-challenges (cert-id uint))
+  (let
+    ((challenge-ids (get challenge-ids (default-to { challenge-ids: (list) } (map-get? cert-challenge-index { cert-id: cert-id })))))
+    (> (len (filter is-challenge-active (map get-challenge challenge-ids))) u0)
+  )
+)
+
+;; Helper to check if a challenge is active
+(define-private (is-challenge-active (challenge (optional {
+    cert-id: uint,
+    challenger: principal,
+    reason: (string-ascii 200),
+    evidence: (string-ascii 200),
+    status: (string-ascii 20),
+    created-at: uint,
+    response: (optional {
+      text: (string-ascii 200),
+      evidence: (string-ascii 200),
+      timestamp: uint
+    }),
+    resolution: (optional {
+      result: (string-ascii 20),
+      resolver: principal,
+      timestamp: uint,
+      notes: (string-ascii 200)
+    })
+  })))
+  (match challenge
+    challenge-data (is-eq (get status challenge-data) "open")
+    false
+  )
+)
