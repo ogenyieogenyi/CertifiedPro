@@ -10,6 +10,43 @@
 (define-constant err-already-exists (err u102))
 (define-constant err-unauthorized (err u103))
 (define-constant err-expired (err u104))
+(define-constant err-insufficient-stake (err u116))
+(define-constant err-stake-locked (err u117))
+(define-constant err-no-stake (err u118))
+(define-constant err-slash-failed (err u119))
+
+(define-map certification-stakes
+  { cert-id: uint }
+  {
+    staked-amount: uint,
+    stake-date: uint,
+    lock-period: uint,
+    slashed-amount: uint,
+    reputation-score: uint
+  }
+)
+
+(define-map user-reputation
+  { user: principal }
+  {
+    total-staked: uint,
+    total-slashed: uint,
+    successful-defenses: uint,
+    failed-challenges: uint,
+    reputation-level: uint
+  }
+)
+
+(define-map stake-pool
+  { pool-id: uint }
+  {
+    total-amount: uint,
+    participant-count: uint
+  }
+)
+
+(define-data-var total-staked uint u0)
+(define-data-var stake-pool-id uint u1)
 
 ;; Data maps
 ;; Store professional certifications
@@ -835,5 +872,223 @@
   (match challenge
     challenge-data (is-eq (get status challenge-data) "open")
     false
+  )
+)
+
+
+
+(define-public (stake-certification (cert-id uint) (amount uint) (lock-months uint))
+  (let
+    (
+      (cert (unwrap! (map-get? certifications { id: cert-id }) (err err-not-found)))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (lock-period (* lock-months u2592000))
+      (user-rep (default-to 
+        { total-staked: u0, total-slashed: u0, successful-defenses: u0, failed-challenges: u0, reputation-level: u1 }
+        (map-get? user-reputation { user: tx-sender })))
+    )
+    (asserts! (is-eq tx-sender (get owner cert)) (err err-unauthorized))
+    (asserts! (get active cert) (err err-expired))
+    (asserts! (>= amount u1000000) (err err-insufficient-stake))
+    
+    ;; (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set certification-stakes
+      { cert-id: cert-id }
+      {
+        staked-amount: amount,
+        stake-date: current-time,
+        lock-period: lock-period,
+        slashed-amount: u0,
+        reputation-score: (calculate-initial-reputation amount lock-months)
+      }
+    )
+    
+    (map-set user-reputation
+      { user: tx-sender }
+      (merge user-rep { 
+        total-staked: (+ (get total-staked user-rep) amount),
+        reputation-level: (calculate-reputation-level 
+          (+ (get total-staked user-rep) amount)
+          (get total-slashed user-rep)
+          (get successful-defenses user-rep))
+      })
+    )
+    
+    (var-set total-staked (+ (var-get total-staked) amount))
+    
+    (ok true)
+  )
+)
+
+(define-public (unstake-certification (cert-id uint))
+  (let
+    (
+      (cert (unwrap! (map-get? certifications { id: cert-id }) (err err-not-found)))
+      (stake (unwrap! (map-get? certification-stakes { cert-id: cert-id }) (err err-no-stake)))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+      (unlock-time (+ (get stake-date stake) (get lock-period stake)))
+      (withdrawable-amount (- (get staked-amount stake) (get slashed-amount stake)))
+    )
+    (asserts! (is-eq tx-sender (get owner cert)) (err err-unauthorized))
+    (asserts! (>= current-time unlock-time) (err err-stake-locked))
+    (asserts! (> withdrawable-amount u0) (err err-no-stake))
+    
+    ;; (try! (as-contract (stx-transfer? withdrawable-amount tx-sender (get owner cert))))
+    
+    (map-delete certification-stakes { cert-id: cert-id })
+    (var-set total-staked (- (var-get total-staked) withdrawable-amount))
+    
+    (ok withdrawable-amount)
+  )
+)
+
+(define-public (slash-stake (cert-id uint) (slash-percentage uint))
+  (let
+    (
+      (cert (unwrap! (map-get? certifications { id: cert-id }) (err err-not-found)))
+      (stake (unwrap! (map-get? certification-stakes { cert-id: cert-id }) (err err-no-stake)))
+      (slash-amount (/ (* (get staked-amount stake) slash-percentage) u100))
+      (cert-owner (get owner cert))
+      (user-rep (default-to 
+        { total-staked: u0, total-slashed: u0, successful-defenses: u0, failed-challenges: u0, reputation-level: u1 }
+        (map-get? user-reputation { user: cert-owner })))
+    )
+    (asserts! (is-eq tx-sender contract-owner) (err err-unauthorized))
+    (asserts! (<= slash-percentage u100) (err err-unauthorized))
+    
+    (map-set certification-stakes
+      { cert-id: cert-id }
+      (merge stake { 
+        slashed-amount: (+ (get slashed-amount stake) slash-amount),
+        reputation-score: (/ (get reputation-score stake) u2)
+      })
+    )
+    
+    (map-set user-reputation
+      { user: cert-owner }
+      (merge user-rep { 
+        total-slashed: (+ (get total-slashed user-rep) slash-amount),
+        reputation-level: (calculate-reputation-level 
+          (get total-staked user-rep)
+          (+ (get total-slashed user-rep) slash-amount)
+          (get successful-defenses user-rep))
+      })
+    )
+    
+    (ok slash-amount)
+  )
+)
+
+(define-public (reward-successful-defense (cert-id uint))
+  (let
+    (
+      (cert (unwrap! (map-get? certifications { id: cert-id }) (err err-not-found)))
+      (stake (unwrap! (map-get? certification-stakes { cert-id: cert-id }) (err err-no-stake)))
+      (cert-owner (get owner cert))
+      (user-rep (default-to 
+        { total-staked: u0, total-slashed: u0, successful-defenses: u0, failed-challenges: u0, reputation-level: u1 }
+        (map-get? user-reputation { user: cert-owner })))
+      (bonus-amount (/ (get staked-amount stake) u10))
+    )
+    (asserts! (is-eq tx-sender contract-owner) (err err-unauthorized))
+    
+    (map-set certification-stakes
+      { cert-id: cert-id }
+      (merge stake { 
+        reputation-score: (+ (get reputation-score stake) u10)
+      })
+    )
+    
+    (map-set user-reputation
+      { user: cert-owner }
+      (merge user-rep { 
+        successful-defenses: (+ (get successful-defenses user-rep) u1),
+        reputation-level: (calculate-reputation-level 
+          (get total-staked user-rep)
+          (get total-slashed user-rep)
+          (+ (get successful-defenses user-rep) u1))
+      })
+    )
+    
+    ;; (try! (as-contract (stx-transfer? bonus-amount tx-sender cert-owner)))
+    
+    (ok bonus-amount)
+  )
+)
+
+(define-read-only (get-certification-stake (cert-id uint))
+  (map-get? certification-stakes { cert-id: cert-id })
+)
+
+(define-read-only (get-user-reputation (user principal))
+  (map-get? user-reputation { user: user })
+)
+
+(define-read-only (get-stake-info (cert-id uint))
+  (let
+    (
+      (stake (map-get? certification-stakes { cert-id: cert-id }))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (match stake
+      stake-data (some {
+        staked-amount: (get staked-amount stake-data),
+        withdrawable-amount: (- (get staked-amount stake-data) (get slashed-amount stake-data)),
+        is-locked: (< current-time (+ (get stake-date stake-data) (get lock-period stake-data))),
+        reputation-score: (get reputation-score stake-data),
+        unlock-date: (+ (get stake-date stake-data) (get lock-period stake-data))
+      })
+      none
+    )
+  )
+)
+
+
+(define-read-only (get-total-staked)
+  (var-get total-staked)
+)
+
+(define-read-only (is-stake-locked (cert-id uint))
+  (let
+    (
+      (stake (map-get? certification-stakes { cert-id: cert-id }))
+      (current-time (default-to u0 (get-stacks-block-info? time (- stacks-block-height u1))))
+    )
+    (match stake
+      stake-data (< current-time (+ (get stake-date stake-data) (get lock-period stake-data)))
+      false
+    )
+  )
+)
+
+(define-private (get-min (a uint) (b uint))
+  (if (<= a b) a b)
+)
+
+(define-private (calculate-initial-reputation (amount uint) (lock-months uint))
+  (let
+    (
+      (amount-score (get-min (/ amount u100000) u50))
+      (time-score (get-min (* lock-months u5) u30))
+    )
+    (+ amount-score time-score u20)
+  )
+)
+
+(define-private (get-max (a uint) (b uint))
+  (if (>= a b) a b)
+)
+
+(define-private (calculate-reputation-level (total-stake uint) (total-slashed uint) (successful-defenses uint))
+  (let
+    (
+      (stake-ratio (if (> total-stake u0) (/ (* total-slashed u100) total-stake) u0))
+      (defense-bonus (get-min (* successful-defenses u10) u50))
+  )
+  (if (< stake-ratio u10)
+    (get-min (+ u1 (/ total-stake u1000000) defense-bonus) u10)
+    (get-max (- u5 (/ stake-ratio u10)) u1)
+  )
   )
 )
