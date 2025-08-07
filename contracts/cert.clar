@@ -421,6 +421,61 @@
     (map-get? bulk-operation-results { operation-id: operation-id })
 )
 
+;; Integration with skills assessment system
+(define-public (issue-certification-with-assessment
+    (title (string-ascii 100))
+    (issuer (string-ascii 100))
+    (issue-date uint)
+    (expiry-date uint)
+    (skills (list 10 (string-ascii 50)))
+    (required-assessment-id uint)
+)
+    (let
+        (
+            (cert-id (var-get next-id))
+            (user-certs (default-to { cert-ids: (list) } (map-get? user-certifications { owner: tx-sender })))
+            ;; Check if user passed required assessment by calling skills-assessment contract
+            (assessment-passed (contract-call? .skills-assessment has-passed-assessment tx-sender required-assessment-id))
+        )
+        
+        ;; Ensure user has passed the required assessment
+        (asserts! assessment-passed (err err-unauthorized))
+        
+        ;; Ensure user doesn't exceed certification limit
+        (asserts! (< (len (get cert-ids user-certs)) u50) (err err-bulk-limit-exceeded))
+        
+        ;; Validate input data
+        (asserts! (> (len title) u0) (err err-empty-bulk-operation))
+        (asserts! (> (len issuer) u0) (err err-empty-bulk-operation))
+        (asserts! (> expiry-date issue-date) (err err-empty-bulk-operation))
+        
+        ;; Increment certification ID
+        (var-set next-id (+ cert-id u1))
+        
+        ;; Create the certification
+        (map-set certifications
+            { id: cert-id }
+            {
+                owner: tx-sender,
+                title: title,
+                issuer: issuer,
+                issue-date: issue-date,
+                expiry-date: expiry-date,
+                skills: skills,
+                active: true,
+            }
+        )
+        
+        ;; Update user's certification list
+        (map-set user-certifications
+            { owner: tx-sender }
+            { cert-ids: (unwrap-panic (as-max-len? (append (get cert-ids user-certs) cert-id) u50)) }
+        )
+        
+        (ok cert-id)
+    )
+)
+
 (define-private (get-max
         (a uint)
         (b uint)
